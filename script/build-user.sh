@@ -6,6 +6,8 @@ then
 	FULLTARGET=${2}-all
 fi
 
+#edit to add system user
+
 cd ${ROOT_DIR}/user
 if [ ! -d ${FULLTARGET} ]
 then
