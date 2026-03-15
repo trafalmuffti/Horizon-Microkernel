@@ -1,0 +1,3 @@
+[submodule "lib/wolfip"]
+	path = lib/wolfip
+	url = https://github.com/wolfSSL/wolfip

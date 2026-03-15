@@ -15,7 +15,15 @@ then
 	exit 1
 fi
 
-make TARGET=${2} ARCH=${1} TARGET_ROOT=${FULLTARGET}
+# If the target has its own Makefile, invoke it directly rather than going
+# through the shared user/Makefile (which only handles generic targets).
+if [ -f ${FULLTARGET}/Makefile ]
+then
+	make -C ${FULLTARGET} ARCH=${1}
+else
+	make TARGET=${2} ARCH=${1} TARGET_ROOT=${FULLTARGET}
+fi
+
 if [ $? != 0 ]
 then
 	echo "Compilation for '${1}' failed!"
