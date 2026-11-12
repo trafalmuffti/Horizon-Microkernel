@@ -180,6 +180,16 @@ static void socket_event_cb(int fd, uint16_t events, void *arg)
         return;
     }
 
+    /* ── Deferred connect: wolfIP reports a completed handshake as writable ── */
+    if ((events & CB_EVENT_WRITABLE) && w->wait_cmd == NET_CMD_WAITCONN) {
+        memset(&resp, 0, sizeof(resp));
+        resp.to   = w->waiter;
+        resp.code = 0;
+        send(&resp);
+        w->waiter = 0;
+        return;
+    }
+
     /* ── Connection closed while client was waiting ── */
     if (events & CB_EVENT_CLOSED) {
         memset(&resp, 0, sizeof(resp));
@@ -371,6 +381,23 @@ static void handle_request(const struct msg *req)
             g_waiters[idx].waiter = 0;
         resp.code = (msgdata_t)wolfIP_sock_close(g_ip, fd);
         send(&resp);
+        break;
+    }
+
+    /* ── NET_CMD_WAITCONN (may defer) ── */
+    case NET_CMD_WAITCONN: {
+        int fd  = (int)req->args[0];
+        int idx = SOCKET_UNMARK(fd);
+
+        if (wolfIP_sock_can_write(g_ip, fd) > 0) {
+            resp.code = 0;      /* already established */
+            send(&resp);
+        } else if (idx >= 0 && idx < MAX_OPEN_SOCKETS) {
+            g_waiters[idx].waiter   = req->from;
+            g_waiters[idx].wait_cmd = NET_CMD_WAITCONN;
+        } else {
+            send(&resp);
+        }
         break;
     }
 

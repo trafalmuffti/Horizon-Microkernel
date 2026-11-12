@@ -125,3 +125,15 @@
  *   request is rejected with 0 while the first is pending.
  */
 #define NET_CMD_RESOLVE  9
+
+/*
+ * NET_CMD_WAITCONN – Wait for a TCP connection to finish its handshake.
+ *   args[0] = socket fd previously passed to NET_CMD_CONNECT
+ *   Blocks until the socket becomes writable (deferred reply), which wolfIP
+ *   signals via CB_EVENT_WRITABLE once the handshake completes.
+ *   Returns: 0 once connected, negative if the peer closed or reset first.
+ *
+ *   NET_CMD_CONNECT only queues the SYN, so this is how a client learns the
+ *   connection actually came up. Used by ping's TCP fallback probe.
+ */
+#define NET_CMD_WAITCONN 10

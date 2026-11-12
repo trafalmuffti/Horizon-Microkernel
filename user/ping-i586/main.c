@@ -45,6 +45,17 @@
 #define PING_PAYLOAD    32      /* Payload bytes after the header   */
 #define PING_TIMEOUT_MS 4000    /* Per-request wait before giving up */
 
+/*
+ * TCP fallback probe.
+ *
+ * ICMP is filtered on many networks, so a total loss of echo replies does not
+ * by itself mean the host is unreachable.  When every echo request goes
+ * unanswered we fall back once to a TCP handshake against a port that is
+ * commonly open.  A completed handshake proves the host is reachable and
+ * routable even though ICMP is being dropped.
+ */
+#define PING_TCP_PORT   443     /* Probed once if no echo replies arrive */
+
 /* ── Address helpers ────────────────────────────────────────────────────── */
 
 static bool parse_ipv4(const char *s, uint32_t *out)
@@ -149,6 +160,52 @@ static long net_call(msgdata_t code,
     return (long)(int32_t)res.code;
 }
 
+/* ── TCP fallback probe ─────────────────────────────────────────────────── */
+
+/*
+ * tcp_probe - complete a single TCP handshake against @ip:@port.
+ *
+ * Returns the handshake round-trip in milliseconds, or -1 on failure.
+ *
+ * The connection is torn down immediately afterwards with one close().
+ * Note that this sends a FIN rather than a reset: wolfIP's public API
+ * exposes no abortive close, and struct wolfIP is opaque to us, so a
+ * graceful shutdown is the only teardown available here.
+ */
+static long tcp_probe(uint32_t ip, uint16_t port)
+{
+    uint32_t t0, rtt;
+    int      sock;
+
+    sock = (int)net_call(NET_CMD_SOCKET, NET_SOCK_STREAM, 0, 0,
+                         NULL, 0, NULL, 0);
+    if (sock < 0)
+        return -1;
+
+    t0 = clock_ms();
+
+    /* NET_CMD_CONNECT only queues the SYN... */
+    if (net_call(NET_CMD_CONNECT, (msgdata_t)sock, ip, port,
+                 NULL, 0, NULL, 0) < 0) {
+        net_call(NET_CMD_CLOSE, (msgdata_t)sock, 0, 0, NULL, 0, NULL, 0);
+        return -1;
+    }
+
+    /* ...so wait for the handshake to actually complete. */
+    if (net_call(NET_CMD_WAITCONN, (msgdata_t)sock, 0, 0,
+                 NULL, 0, NULL, 0) < 0) {
+        net_call(NET_CMD_CLOSE, (msgdata_t)sock, 0, 0, NULL, 0, NULL, 0);
+        return -1;
+    }
+
+    rtt = clock_ms() - t0;
+
+    /* Tear the connection down once; we only needed the handshake. */
+    net_call(NET_CMD_CLOSE, (msgdata_t)sock, 0, 0, NULL, 0, NULL, 0);
+
+    return (long)rtt;
+}
+
 /* ── Entry point ────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -245,7 +302,9 @@ int main(void)
         if (rtt < rtt_min) rtt_min = rtt;
         if (rtt > rtt_max) rtt_max = rtt;
 
-        printf("%ld bytes from ", n);
+        /* libh's vprintf implements no length modifiers, so %ld would
+         * misparse; narrow to int explicitly. */
+        printf("%d bytes from ", (int)n);
         print_ipv4(dest_ip);
         printf(": icmp_seq=%d time=%u ms\n", seq, (unsigned)rtt);
     }
@@ -257,11 +316,43 @@ int main(void)
     printf("%d packets transmitted, %d received, %d%% packet loss\n",
            sent, received,
            sent ? ((sent - received) * 100) / sent : 0);
-    if (received)
+    if (received) {
         printf("rtt min/avg/max = %u/%u/%u ms\n",
                (unsigned)rtt_min,
                (unsigned)(rtt_total / (uint32_t)received),
                (unsigned)rtt_max);
+        return 0;
+    }
 
-    return received ? 0 : 1;
+    /*
+     * No echo replies. ICMP is frequently filtered, so before declaring the
+     * host unreachable, probe once with TCP: a completed handshake shows the
+     * host is reachable and that only ICMP is being dropped.
+     */
+    {
+        long tcp_rtt;
+
+        printf("\nNo ICMP replies; ICMP may be filtered.\n");
+        printf("Probing ");
+        print_ipv4(dest_ip);
+        printf(":%u with TCP...\n", (unsigned)PING_TCP_PORT);
+
+        tcp_rtt = tcp_probe(dest_ip, PING_TCP_PORT);
+
+        if (tcp_rtt >= 0) {
+            printf("tcp handshake to ");
+            print_ipv4(dest_ip);
+            printf(":%u succeeded in %u ms (connection closed)\n",
+                   (unsigned)PING_TCP_PORT, (unsigned)tcp_rtt);
+            printf("%s is reachable; ICMP echo is being dropped.\n", target);
+            return 0;
+        }
+
+        printf("tcp handshake to ");
+        print_ipv4(dest_ip);
+        printf(":%u failed\n", (unsigned)PING_TCP_PORT);
+        printf("%s is unreachable over both ICMP and TCP.\n", target);
+    }
+
+    return 1;
 }

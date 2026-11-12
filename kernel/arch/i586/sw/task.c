@@ -74,6 +74,23 @@ void task_switch(task_info_t* curr, task_info_t* next)
 		// Set up the starting values.
 		frame->EIP = next->entry;
 		frame->user_esp = next->stack;
+
+		/* Build the rest of the ring-3 context as well.
+		 *
+		 * The frame being edited belongs to whatever was interrupted, which
+		 * for a task switch is kernel code. Setting only EIP and the user
+		 * stack left the kernel's CS and the interrupted ESP/EFLAGS in
+		 * place, so iret stayed in ring 0 and the new thread faulted on its
+		 * first instruction. These are the same selectors task_start() uses
+		 * to cold start the very first thread.
+		 */
+		frame->CS = 0x18|0x3; //< User code segment, RPL 3.
+		frame->SS = 0x20|0x3; //< User data segment, RPL 3.
+		frame->DS = frame->ES = frame->FS = frame->GS = 0x20|0x3;
+
+		/* Bit 1 is reserved and always set; 0x200 enables interrupts so the
+		 * timer can preempt the thread. */
+		frame->EFLAGS = 0x202;
 	}
 	else
 	{

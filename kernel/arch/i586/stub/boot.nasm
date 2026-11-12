@@ -43,6 +43,7 @@ MBH_CHECKSUM   equ -(MBH_MAGIC + MBH_FLAGS)
 BL_PGDIR       equ 0x9D000
 BL_PGTBL_ID    equ 0x9E000
 BL_PGTBL_3G    equ 0x9F000
+BL_PGTBL_ID2   equ 0x9C000
 BL_PGTBL_FLAGS equ 0x3
 
 ; ==================
@@ -60,6 +61,16 @@ bootstrap: push eax ; Save MultiBoot magic
            or   ebx, BL_PGTBL_FLAGS
            call map
 
+           ; Identity map the second 4MB as well.
+           ; The kernel's BSS reserve carries its image up to the 4MB mark, so
+           ; a bootloader appends the boot modules just above that. Mapping
+           ; only the first 4MB left module_init() faulting on mods_addr as
+           ; soon as any module was supplied.
+           mov  eax, BL_PGTBL_ID2
+           mov  ebx, 0x00400000
+           or   ebx, BL_PGTBL_FLAGS
+           call map
+
            ; Calculate the virtual offset to map the kernel
            lea  ecx, [_KERNEL_PHYS_ADDR]
            lea  edx, [_KERNEL_VIRT_ADDR]
@@ -73,7 +84,8 @@ bootstrap: push eax ; Save MultiBoot magic
            call map
 
            ; Format the page directory
-           mov  dword [BL_PGDIR +    0*4], BL_PGTBL_ID | BL_PGTBL_FLAGS
+           mov  dword [BL_PGDIR +    0*4], BL_PGTBL_ID  | BL_PGTBL_FLAGS
+           mov  dword [BL_PGDIR +    1*4], BL_PGTBL_ID2 | BL_PGTBL_FLAGS
            mov  dword [BL_PGDIR +  768*4], BL_PGTBL_3G | BL_PGTBL_FLAGS
            mov  dword [BL_PGDIR + 1023*4], BL_PGDIR    | BL_PGTBL_FLAGS ; Setup recursive mapping
 

@@ -111,7 +111,19 @@ void exception_info(isr_t isr, irq_t irq)
 	}
 
 	const char* errout = NULL;
-	switch (isr)
+
+	/*
+	 * Each group below maps a set of exception numbers onto a message and
+	 * then reports it in the format that group needs.  The do/while(0)
+	 * wrapper lets a group that matched break out early.
+	 *
+	 * This was previously an outer switch(isr) wrapping these groups, which
+	 * placed them ahead of its first case label where they could never be
+	 * reached: every exception except NMI and #PF fell through to the
+	 * default and panicked with "Reserved/invalid exception occurred!"
+	 * rather than printing its own diagnostic.
+	 */
+	do
 	{
 		switch (isr)
 		{
@@ -160,6 +172,9 @@ void exception_info(isr_t isr, irq_t irq)
 			break;
 		}
 
+		/* Exceptions that format their own detailed diagnostic. */
+		switch (isr)
+		{
 		case EXCEPTION_NMI:
 		{
 			dtrace("Non-maskable interrupt; check SYSCTL ports for more info.");
@@ -181,7 +196,8 @@ void exception_info(isr_t isr, irq_t irq)
 
 		default:
 			dpanic("Reserved/invalid exception occurred!");
-	}
+		}
+	} while (0);
 
 #define REP_THRESHOLD 1
 	static int rep_last  = -1; 
