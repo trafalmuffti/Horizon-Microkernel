@@ -1,33 +1,46 @@
 #pragma once
 
 /*
- * Monotonic millisecond clock for Horizon userspace (i586).
+ * Monotonic clock for Horizon userspace (i586), in microseconds.
+ *
+ * Resolution
+ * ──────────
+ * Round-trip times on a local link or an emulated NIC are routinely well
+ * under a millisecond, so a millisecond-granular clock reports them as 0 or
+ * 1 and conveys nothing. The counter below therefore accumulates in
+ * microseconds, and clock_ms() is derived from it for callers that want
+ * coarse time (wolfIP's poll loop only needs a forward-moving millisecond
+ * value for its retransmit timers).
  *
  * Why not just divide the 64-bit TSC
- * ─────────────────────────────────
- * Userspace programs are linked with -nodefaultlibs, so libgcc is absent and
- * any 64-bit division emits an undefined reference to __udivdi3.  The 32-bit
- * `div` instruction, by contrast, is generated inline by the compiler.
+ * ──────────────────────────────────
+ * Userspace links with -nodefaultlibs, so libgcc is absent and any 64-bit
+ * division emits an undefined reference to __udivdi3. The 32-bit `div`
+ * instruction is generated inline, so every division here is 32-bit.
  *
- * So we read only the low 32 bits of the TSC and accumulate *deltas* into a
- * software counter.  Unsigned subtraction wraps correctly, so the delta stays
- * accurate across a TSC rollover (~43 s at 100 MHz) provided the clock is
- * sampled more frequently than that.  The remainder is carried between calls
- * so no time is lost to truncation.
+ * We read the low 32 bits of the TSC and accumulate *deltas*. Unsigned
+ * subtraction wraps correctly, so a delta stays accurate across a TSC
+ * rollover as long as the clock is sampled more often than once per
+ * rollover. Remainders are carried between calls, so no time is lost to
+ * truncation.
  *
- * The resulting counter is monotonic, which is what wolfIP's poll loop needs;
- * absolute accuracy depends on TSC_PER_MS matching the real CPU frequency and
- * only affects the scale of retransmit timeouts and reported round-trip times.
+ * ACCURACY WARNING
+ * ────────────────
+ * TSC_PER_US below is an uncalibrated guess. Horizon exposes no userspace
+ * time reference to calibrate against: the PIT is owned by the kernel
+ * scheduler, and there is no timer syscall. On real hardware the TSC ticks
+ * at the CPU's nominal frequency; under QEMU it generally ticks at the
+ * host's rate, which is typically 2-3 GHz rather than the 100 MHz assumed
+ * here. Until this constant is calibrated for the machine in question, the
+ * values are correct in their ordering and proportion but NOT in absolute
+ * magnitude, and callers should present them as such. Override at build
+ * time with -DTSC_PER_US=<ticks per microsecond>.
  */
 
 #include <stdint.h>
 
-/*
- * TSC ticks per millisecond.  QEMU's emulated i586 runs at roughly 100 MHz;
- * override at build time with -DTSC_PER_MS=<n> to calibrate.
- */
-#ifndef TSC_PER_MS
-#define TSC_PER_MS 100000U
+#ifndef TSC_PER_US
+#define TSC_PER_US 100U
 #endif
 
 static inline uint32_t tsc_read32(void)
@@ -39,33 +52,54 @@ static inline uint32_t tsc_read32(void)
 }
 
 /* Clock state. Header-only, so each program gets its own instance. */
-static uint32_t _ms_last_tsc;
-static uint32_t _ms_carry;
-static uint32_t _ms_value;
-static int      _ms_started;
+static uint32_t _clk_last_tsc;
+static uint32_t _clk_tsc_carry;  /* TSC ticks not yet worth a microsecond  */
+static uint32_t _clk_us_carry;   /* microseconds not yet worth a millisecond */
+static uint32_t _clk_us;         /* microseconds since first call           */
+static uint32_t _clk_ms;         /* milliseconds since first call           */
+static int      _clk_started;
 
 /*
- * clock_ms - milliseconds since the first call.
- * Must be called at least once per TSC rollover to stay accurate.
+ * _clk_update - fold elapsed TSC ticks into the microsecond and
+ * millisecond counters. Must run at least once per TSC rollover
+ * (~43 s at 100 MHz, ~1.4 s at 3 GHz) to stay accurate.
  */
-static uint32_t clock_ms(void)
+static void _clk_update(void)
 {
     uint32_t now = tsc_read32();
-    uint32_t delta;
+    uint32_t delta, us;
 
-    if (!_ms_started) {
-        _ms_started  = 1;
-        _ms_last_tsc = now;
-        return 0;
+    if (!_clk_started) {
+        _clk_started  = 1;
+        _clk_last_tsc = now;
+        return;
     }
 
     /* Unsigned subtraction yields the correct delta even across a wrap. */
-    delta = now - _ms_last_tsc;
-    _ms_last_tsc = now;
+    delta = now - _clk_last_tsc;
+    _clk_last_tsc = now;
 
-    _ms_carry += delta;
-    _ms_value += _ms_carry / TSC_PER_MS;   /* 32-bit div: inlined by gcc */
-    _ms_carry %= TSC_PER_MS;
+    _clk_tsc_carry += delta;
+    us = _clk_tsc_carry / TSC_PER_US;   /* 32-bit div: inlined by gcc */
+    _clk_tsc_carry %= TSC_PER_US;
 
-    return _ms_value;
+    _clk_us += us;
+
+    _clk_us_carry += us;
+    _clk_ms += _clk_us_carry / 1000U;
+    _clk_us_carry %= 1000U;
+}
+
+/* Microseconds since the first call. Wraps after ~71 minutes. */
+static uint32_t clock_us(void)
+{
+    _clk_update();
+    return _clk_us;
+}
+
+/* Milliseconds since the first call. */
+static uint32_t clock_ms(void)
+{
+    _clk_update();
+    return _clk_ms;
 }

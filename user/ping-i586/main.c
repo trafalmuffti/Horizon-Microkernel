@@ -95,6 +95,26 @@ static void print_ipv4(uint32_t ip)
            (unsigned)((ip >> 8)  & 0xFF), (unsigned)(ip & 0xFF));
 }
 
+/* ── Duration formatting ────────────────────────────────────────────────── */
+
+/*
+ * print_duration - render a microsecond count as milliseconds with three
+ * decimal places, e.g. 437us -> "0.437 ms".
+ *
+ * Round-trips here are frequently sub-millisecond, so printing whole
+ * milliseconds would collapse most results to "0 ms". libh's vprintf
+ * implements no floating point, so the fractional part is composed from the
+ * integer remainder and zero-padded by hand.
+ */
+static void print_duration(uint32_t usec)
+{
+    printf("%u.%u%u%u ms",
+           (unsigned)(usec / 1000U),
+           (unsigned)((usec / 100U) % 10U),
+           (unsigned)((usec / 10U)  % 10U),
+           (unsigned)(usec % 10U));
+}
+
 /* ── netd IPC helpers ───────────────────────────────────────────────────── */
 
 static ipcport_t g_netd;
@@ -165,7 +185,7 @@ static long net_call(msgdata_t code,
 /*
  * tcp_probe - complete a single TCP handshake against @ip:@port.
  *
- * Returns the handshake round-trip in milliseconds, or -1 on failure.
+ * Returns the handshake round-trip in microseconds, or -1 on failure.
  *
  * The connection is torn down immediately afterwards with one close().
  * Note that this sends a FIN rather than a reset: wolfIP's public API
@@ -174,7 +194,7 @@ static long net_call(msgdata_t code,
  */
 static long tcp_probe(uint32_t ip, uint16_t port)
 {
-    uint32_t t0, rtt;
+    uint32_t t0, rtt_us;
     int      sock;
 
     sock = (int)net_call(NET_CMD_SOCKET, NET_SOCK_STREAM, 0, 0,
@@ -182,7 +202,7 @@ static long tcp_probe(uint32_t ip, uint16_t port)
     if (sock < 0)
         return -1;
 
-    t0 = clock_ms();
+    t0 = clock_us();
 
     /* NET_CMD_CONNECT only queues the SYN... */
     if (net_call(NET_CMD_CONNECT, (msgdata_t)sock, ip, port,
@@ -198,12 +218,12 @@ static long tcp_probe(uint32_t ip, uint16_t port)
         return -1;
     }
 
-    rtt = clock_ms() - t0;
+    rtt_us = clock_us() - t0;
 
     /* Tear the connection down once; we only needed the handshake. */
     net_call(NET_CMD_CLOSE, (msgdata_t)sock, 0, 0, NULL, 0, NULL, 0);
 
-    return (long)rtt;
+    return (long)rtt_us;
 }
 
 /* ── Entry point ────────────────────────────────────────────────────────── */
@@ -214,7 +234,7 @@ int main(void)
     uint32_t    dest_ip = 0;
     int         sock;
     int         sent = 0, received = 0;
-    uint32_t    rtt_total = 0, rtt_min = 0xFFFFFFFFU, rtt_max = 0;
+    uint32_t    rtt_total_us = 0, rtt_min_us = 0xFFFFFFFFU, rtt_max_us = 0;
     int         seq;
 
     /* Wait for the network daemon to come up. */
@@ -255,7 +275,7 @@ int main(void)
     for (seq = 1; seq <= PING_COUNT; seq++) {
         uint8_t  packet[NET_ICMP_HDR_LEN + PING_PAYLOAD];
         uint8_t  reply[NET_ICMP_HDR_LEN + PING_PAYLOAD + 64];
-        uint32_t t0, rtt;
+        uint32_t t0, rtt_us;
         long     n;
         int      i;
 
@@ -272,7 +292,7 @@ int main(void)
         for (i = 0; i < PING_PAYLOAD; i++)
             packet[NET_ICMP_HDR_LEN + i] = (uint8_t)('a' + (i % 26));
 
-        t0 = clock_ms();
+        t0 = clock_us();
 
         if (net_call(NET_CMD_SEND, (msgdata_t)sock, 0, 0,
                      packet, sizeof(packet), NULL, 0) < 0) {
@@ -285,7 +305,7 @@ int main(void)
         n = net_call(NET_CMD_RECV, (msgdata_t)sock, sizeof(reply), 0,
                      NULL, 0, reply, sizeof(reply));
 
-        rtt = clock_ms() - t0;
+        rtt_us = clock_us() - t0;
 
         if (n < (long)NET_ICMP_HDR_LEN) {
             printf("Request timeout for icmp_seq=%d\n", seq);
@@ -298,15 +318,17 @@ int main(void)
         }
 
         received++;
-        rtt_total += rtt;
-        if (rtt < rtt_min) rtt_min = rtt;
-        if (rtt > rtt_max) rtt_max = rtt;
+        rtt_total_us += rtt_us;
+        if (rtt_us < rtt_min_us) rtt_min_us = rtt_us;
+        if (rtt_us > rtt_max_us) rtt_max_us = rtt_us;
 
         /* libh's vprintf implements no length modifiers, so %ld would
          * misparse; narrow to int explicitly. */
         printf("%d bytes from ", (int)n);
         print_ipv4(dest_ip);
-        printf(": icmp_seq=%d time=%u ms\n", seq, (unsigned)rtt);
+        printf(": icmp_seq=%d time=", seq);
+        print_duration(rtt_us);
+        printf("\n");
     }
 
     net_call(NET_CMD_CLOSE, (msgdata_t)sock, 0, 0, NULL, 0, NULL, 0);
@@ -317,10 +339,13 @@ int main(void)
            sent, received,
            sent ? ((sent - received) * 100) / sent : 0);
     if (received) {
-        printf("rtt min/avg/max = %u/%u/%u ms\n",
-               (unsigned)rtt_min,
-               (unsigned)(rtt_total / (uint32_t)received),
-               (unsigned)rtt_max);
+        printf("rtt min/avg/max = ");
+        print_duration(rtt_min_us);
+        printf(" / ");
+        print_duration(rtt_total_us / (uint32_t)received);
+        printf(" / ");
+        print_duration(rtt_max_us);
+        printf("\n");
         return 0;
     }
 
@@ -330,20 +355,21 @@ int main(void)
      * host is reachable and that only ICMP is being dropped.
      */
     {
-        long tcp_rtt;
+        long tcp_rtt_us;
 
         printf("\nNo ICMP replies; ICMP may be filtered.\n");
         printf("Probing ");
         print_ipv4(dest_ip);
         printf(":%u with TCP...\n", (unsigned)PING_TCP_PORT);
 
-        tcp_rtt = tcp_probe(dest_ip, PING_TCP_PORT);
+        tcp_rtt_us = tcp_probe(dest_ip, PING_TCP_PORT);
 
-        if (tcp_rtt >= 0) {
+        if (tcp_rtt_us >= 0) {
             printf("tcp handshake to ");
             print_ipv4(dest_ip);
-            printf(":%u succeeded in %u ms (connection closed)\n",
-                   (unsigned)PING_TCP_PORT, (unsigned)tcp_rtt);
+            printf(":%u succeeded in ", (unsigned)PING_TCP_PORT);
+            print_duration((uint32_t)tcp_rtt_us);
+            printf(" (connection closed)\n");
             printf("%s is reachable; ICMP echo is being dropped.\n", target);
             return 0;
         }
