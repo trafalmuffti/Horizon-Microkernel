@@ -81,7 +81,7 @@ WOLFIP_INCLUDES =                               \
 
 OBJ_DIR  = build/netd-$(ARCH)/obj
 
-DRIVER_SRCS = ne2000.c main.c
+DRIVER_SRCS = ne2000.c main.c wolfip_port.c
 DRIVER_OBJS = $(patsubst %.c, $(OBJ_DIR)/%.o, $(DRIVER_SRCS))
 
 WOLFIP_OBJ  = $(OBJ_DIR)/wolfip.o

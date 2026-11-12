@@ -43,7 +43,9 @@
 
 #include "ne2000.h"
 #include "net_svc.h"
+#include "../util-i586/time.h"
 #include "wolfip.h"  /* Horizon wrapper – silences LOG, sets freestanding config */
+#include "config.h"  /* WOLFIP_DEFAULT_IP / _MASK / _GW; wolfip.h does not pull this in */
 
 /* ── Configuration ──────────────────────────────────────────────────────── */
 
@@ -56,24 +58,14 @@
 /* Maximum concurrent open sockets (index is SOCKET_UNMARK(fd)) */
 #define MAX_OPEN_SOCKETS 256
 
-/* ── Timing (RDTSC-based ms counter) ────────────────────────────────────── */
-
-static inline uint64_t rdtsc64(void)
-{
-    uint32_t lo, hi;
-    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | (uint64_t)lo;
-}
-
 /*
- * get_ms: approximate milliseconds since boot.
- * Assumes ~100 MHz TSC (QEMU i586 default).  Accuracy is not critical;
- * wolfIP only needs a forward-moving counter for retransmit timers.
+ * wolfIP's IP protocol number for ICMP.  wolfIP defines WI_IPPROTO_ICMP
+ * privately inside wolfip.c, so we repeat the IANA value here.
  */
-static uint32_t get_ms(void)
-{
-    return (uint32_t)(rdtsc64() / 100000ULL);
-}
+#define WOLFIP_PROTO_ICMP 1
+
+/* Longest hostname accepted by NET_CMD_RESOLVE */
+#define MAX_HOSTNAME 128
 
 /* ── Global state ───────────────────────────────────────────────────────── */
 
@@ -92,6 +84,32 @@ typedef struct {
 } sock_waiter_t;
 
 static sock_waiter_t g_waiters[MAX_OPEN_SOCKETS];
+
+/*
+ * Pending DNS query.
+ *
+ * wolfIP's nslookup() callback signature carries no user-supplied context
+ * argument, so the port of the blocked client is held here.  wolfIP keeps a
+ * single DNS query slot per stack instance, so one pending request at a time
+ * is the natural limit.
+ */
+static ipcport_t g_dns_waiter;   /* 0 = no query in flight */
+static uint16_t  g_dns_id;       /* query id handed back by nslookup() */
+
+static void dns_result_cb(uint32_t ip)
+{
+    struct msg resp;
+
+    if (!g_dns_waiter)
+        return;
+
+    memset(&resp, 0, sizeof(resp));
+    resp.to   = g_dns_waiter;
+    resp.code = (msgdata_t)ip;  /* 0 means lookup failed */
+    send(&resp);
+
+    g_dns_waiter = 0;
+}
 
 /* ── wolfIP link-layer callbacks ────────────────────────────────────────── */
 
@@ -196,10 +214,23 @@ static void handle_request(const struct msg *req)
 
     /* ── NET_CMD_SOCKET ── */
     case NET_CMD_SOCKET: {
-        int wtype = ((int)req->args[0] == NET_SOCK_STREAM)
-                    ? IPSTACK_SOCK_STREAM
-                    : IPSTACK_SOCK_DGRAM;
-        int fd = wolfIP_sock_socket(g_ip, AF_INET, wtype, 0);
+        int wtype, wproto;
+        int fd;
+
+        switch ((int)req->args[0]) {
+        case NET_SOCK_STREAM:
+            wtype = IPSTACK_SOCK_STREAM; wproto = 0;
+            break;
+        case NET_SOCK_ICMP:
+            /* wolfIP exposes ICMP as SOCK_DGRAM with protocol 1 */
+            wtype = IPSTACK_SOCK_DGRAM;  wproto = WOLFIP_PROTO_ICMP;
+            break;
+        default:
+            wtype = IPSTACK_SOCK_DGRAM;  wproto = 0;
+            break;
+        }
+
+        fd = wolfIP_sock_socket(g_ip, AF_INET, wtype, wproto);
         if (fd >= 0) {
             int idx = SOCKET_UNMARK(fd);
             if (idx < MAX_OPEN_SOCKETS) {
@@ -343,6 +374,42 @@ static void handle_request(const struct msg *req)
         break;
     }
 
+    /* ── NET_CMD_RESOLVE (may defer) ── */
+    case NET_CMD_RESOLVE: {
+        char hostname[MAX_HOSTNAME];
+        size_t n;
+
+        resp.code = 0; /* 0 = failure for this command */
+
+        if (!req->payload.buf || req->payload.size == 0U) {
+            send(&resp);
+            break;
+        }
+        if (g_dns_waiter) {
+            /* A query is already in flight; wolfIP holds only one slot. */
+            send(&resp);
+            break;
+        }
+
+        n = req->payload.size;
+        if (n >= sizeof(hostname))
+            n = sizeof(hostname) - 1U;
+        memcpy(hostname, req->payload.buf, n);
+        hostname[n] = '\0';
+
+        /* Park the caller before issuing the query: wolfIP may answer
+         * from cache and invoke the callback synchronously. */
+        g_dns_waiter = req->from;
+
+        if (nslookup(g_ip, hostname, &g_dns_id, dns_result_cb) < 0) {
+            if (g_dns_waiter) {   /* callback did not already reply */
+                g_dns_waiter = 0;
+                send(&resp);
+            }
+        }
+        break;
+    }
+
     default:
         send(&resp);
         break;
@@ -396,17 +463,21 @@ int main(void)
     /* ── 8. Main event loop ── */
     while (true) {
         struct msg req;
-        size_t     payload_sz;
+        long       payload_sz;
 
         /* Block until an IRQ fires or an IPC message arrives */
         wait(IPORT_ANY);
 
-        payload_sz = peek();
+        /* peek() reports failure as (size_t)-1, so read it through a
+         * signed type before testing. */
+        payload_sz = (long)peek();
         memset(&req, 0, sizeof(req));
 
         if (payload_sz > 0) {
-            req.payload.buf  = malloc(payload_sz);
-            req.payload.size = payload_sz;
+            req.payload.buf  = malloc((size_t)payload_sz);
+            req.payload.size = (size_t)payload_sz;
+            if (!req.payload.buf)
+                continue;
         }
 
         if (recv(&req) < 0) {
@@ -422,7 +493,7 @@ int main(void)
              */
             static uint8_t pkt_buf[1536];
             int pkt_len;
-            uint32_t now = get_ms();
+            uint32_t now = clock_ms();
 
             while ((pkt_len = ne2000_rx(&g_ne, pkt_buf, sizeof(pkt_buf))) > 0)
                 wolfIP_recv(g_ip, pkt_buf, (uint32_t)pkt_len);
@@ -431,9 +502,9 @@ int main(void)
             ne2000_irq_ack(&g_ne);
         } else {
             /* IPC socket request from a user process */
-            wolfIP_poll(g_ip, get_ms()); /* tick before handling */
+            wolfIP_poll(g_ip, clock_ms()); /* tick before handling */
             handle_request(&req);
-            wolfIP_poll(g_ip, get_ms()); /* tick after handling */
+            wolfIP_poll(g_ip, clock_ms()); /* tick after handling */
         }
 
         if (req.payload.buf)

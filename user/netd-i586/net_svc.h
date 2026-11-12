@@ -20,8 +20,23 @@
  */
 
 /* ── Socket types (args[0] for NET_CMD_SOCKET) ─────────────────────────── */
-#define NET_SOCK_STREAM 1   /* TCP */
-#define NET_SOCK_DGRAM  2   /* UDP */
+#define NET_SOCK_STREAM 1   /* TCP  */
+#define NET_SOCK_DGRAM  2   /* UDP  */
+#define NET_SOCK_ICMP   3   /* ICMP (used by ping) */
+
+/*
+ * ICMP message layout, for clients building echo requests.
+ *
+ * An ICMP socket carries the COMPLETE ICMP message, not just a payload:
+ * the client supplies type/code/checksum/id/seq followed by its payload.
+ * netd forwards it verbatim to wolfIP, which overwrites the id field with
+ * the socket's identifier and computes the checksum before transmission.
+ * NET_CMD_RECV returns the full ICMP message of the reply, starting at the
+ * type byte.
+ */
+#define NET_ICMP_HDR_LEN       8
+#define NET_ICMP_ECHO_REQUEST  8
+#define NET_ICMP_ECHO_REPLY    0
 
 /* ── Request codes (msg.code) ───────────────────────────────────────────── */
 
@@ -99,3 +114,14 @@
  *   Returns: 0 on success.
  */
 #define NET_CMD_CLOSE    8
+
+/*
+ * NET_CMD_RESOLVE – Resolve a hostname to an IPv4 address via DNS.
+ *   payload = NUL-terminated hostname (e.g. "claude.ai")
+ *   Blocks until the DNS reply arrives (deferred reply).
+ *   Returns: IPv4 address in host byte order, or 0 on failure.
+ *
+ *   Only one DNS query may be in flight at a time; a second concurrent
+ *   request is rejected with 0 while the first is pending.
+ */
+#define NET_CMD_RESOLVE  9

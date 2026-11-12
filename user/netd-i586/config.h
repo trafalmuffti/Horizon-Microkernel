@@ -34,4 +34,11 @@
 #define WOLFIP_DEFAULT_MASK "255.255.255.0"
 #define WOLFIP_DEFAULT_GW   "10.0.2.2"
 
+/*
+ * DNS server used by nslookup().  wolfIP_init_static() seeds its dns_server
+ * field from this; without it nslookup() fails with -101 (no DNS server).
+ * 10.0.2.3 is QEMU's built-in user-mode DNS forwarder.
+ */
+#define WOLFIP_STATIC_DNS_IP "10.0.2.3"
+
 #endif /* WOLF_CONFIG_H */
