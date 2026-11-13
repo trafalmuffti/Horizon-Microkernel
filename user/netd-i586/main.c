@@ -81,6 +81,7 @@ typedef struct {
     ipcport_t waiter;      /* IPC port of the blocked client (0 = none)   */
     int       wait_cmd;    /* Which command is pending                     */
     uint32_t  wait_maxlen; /* For NET_CMD_RECV: requested byte count       */
+    uint32_t  deadline_ms; /* Give up at this time (0 = wait indefinitely) */
 } sock_waiter_t;
 
 static sock_waiter_t g_waiters[MAX_OPEN_SOCKETS];
@@ -93,8 +94,9 @@ static sock_waiter_t g_waiters[MAX_OPEN_SOCKETS];
  * single DNS query slot per stack instance, so one pending request at a time
  * is the natural limit.
  */
-static ipcport_t g_dns_waiter;   /* 0 = no query in flight */
-static uint16_t  g_dns_id;       /* query id handed back by nslookup() */
+static ipcport_t g_dns_waiter;      /* 0 = no query in flight */
+static uint16_t  g_dns_id;          /* query id handed back by nslookup() */
+static uint32_t  g_dns_deadline_ms; /* give up at this time (0 = never)   */
 
 static void dns_result_cb(uint32_t ip)
 {
@@ -109,6 +111,45 @@ static void dns_result_cb(uint32_t ip)
     send(&resp);
 
     g_dns_waiter = 0;
+}
+
+/*
+ * expire_waiters - fail any deferred request whose deadline has passed.
+ *
+ * Without this a client blocks forever whenever the event it is waiting for
+ * never arrives: an ICMP echo that is filtered, a DNS server that does not
+ * answer, a connection that is never accepted. A ping that hangs is worse
+ * than a ping that reports failure, so every deferred reply is bounded.
+ */
+static void expire_waiters(uint32_t now)
+{
+    struct msg resp;
+    int i;
+
+    for (i = 0; i < MAX_OPEN_SOCKETS; i++) {
+        sock_waiter_t *w = &g_waiters[i];
+
+        if (!w->waiter || !w->deadline_ms)
+            continue;
+        /* Signed comparison tolerates the counter wrapping. */
+        if ((int32_t)(now - w->deadline_ms) < 0)
+            continue;
+
+        memset(&resp, 0, sizeof(resp));
+        resp.to   = w->waiter;
+        resp.code = (msgdata_t)(uint32_t)-1;  /* timed out */
+        send(&resp);
+        w->waiter = 0;
+    }
+
+    if (g_dns_waiter && g_dns_deadline_ms &&
+            (int32_t)(now - g_dns_deadline_ms) >= 0) {
+        memset(&resp, 0, sizeof(resp));
+        resp.to   = g_dns_waiter;
+        resp.code = 0;                        /* 0 = lookup failed */
+        send(&resp);
+        g_dns_waiter = 0;
+    }
 }
 
 /* ── wolfIP link-layer callbacks ────────────────────────────────────────── */
@@ -317,9 +358,22 @@ static void handle_request(const struct msg *req)
         addr.sin_family       = AF_INET;
         addr.sin_port         = ee16(port);
         addr.sin_addr.s_addr  = ee32(ip);
-        resp.code = (msgdata_t)wolfIP_sock_connect(g_ip, fd,
-                                                   (struct wolfIP_sockaddr *)&addr,
-                                                   sizeof(addr));
+        int rc = wolfIP_sock_connect(g_ip, fd,
+                                     (struct wolfIP_sockaddr *)&addr,
+                                     sizeof(addr));
+
+        /*
+         * A TCP connect cannot complete synchronously: wolfIP emits the SYN
+         * and reports -EAGAIN to mean "in progress". That is success for
+         * this command, which only promises the SYN was queued; the caller
+         * learns the outcome from NET_CMD_WAITCONN.
+         *
+         * Passing the -EAGAIN through made clients read it as failure and
+         * close the socket, so the SYN|ACK came back to a closed socket and
+         * wolfIP answered it with a reset, killing every connection just as
+         * the peer accepted it.
+         */
+        resp.code = (msgdata_t)((rc == -(WOLFIP_EAGAIN)) ? 0 : rc);
         send(&resp);
         break;
     }
@@ -360,9 +414,12 @@ static void handle_request(const struct msg *req)
             /* Defer */
             int idx = SOCKET_UNMARK(fd);
             if (idx >= 0 && idx < MAX_OPEN_SOCKETS) {
+                uint32_t timeout = req->args[2];
                 g_waiters[idx].waiter      = req->from;
                 g_waiters[idx].wait_cmd    = NET_CMD_RECV;
                 g_waiters[idx].wait_maxlen = maxlen;
+                g_waiters[idx].deadline_ms =
+                    timeout ? (clock_ms() + timeout) : 0;
             } else {
                 send(&resp);
             }
@@ -393,8 +450,10 @@ static void handle_request(const struct msg *req)
             resp.code = 0;      /* already established */
             send(&resp);
         } else if (idx >= 0 && idx < MAX_OPEN_SOCKETS) {
-            g_waiters[idx].waiter   = req->from;
-            g_waiters[idx].wait_cmd = NET_CMD_WAITCONN;
+            uint32_t timeout = req->args[1];
+            g_waiters[idx].waiter      = req->from;
+            g_waiters[idx].wait_cmd    = NET_CMD_WAITCONN;
+            g_waiters[idx].deadline_ms = timeout ? (clock_ms() + timeout) : 0;
         } else {
             send(&resp);
         }
@@ -427,6 +486,7 @@ static void handle_request(const struct msg *req)
         /* Park the caller before issuing the query: wolfIP may answer
          * from cache and invoke the callback synchronously. */
         g_dns_waiter = req->from;
+        g_dns_deadline_ms = req->args[0] ? (clock_ms() + req->args[0]) : 0;
 
         if (nslookup(g_ip, hostname, &g_dns_id, dns_result_cb) < 0) {
             if (g_dns_waiter) {   /* callback did not already reply */
@@ -487,55 +547,69 @@ int main(void)
     if (svcown(SVC_IRQ(NE2000_IRQ_N)) < 0)
         return 1;
 
-    /* ── 8. Main event loop ── */
+    /* ── 8. Main service loop ──
+     *
+     * This polls rather than blocking in wait(). A TCP/IP stack has its own
+     * notion of time: retransmits, DHCP and DNS retries and connection
+     * timeouts only fire when wolfIP_poll() is called. Blocking until an IRQ
+     * or an IPC request arrived meant the stack was ticked only when someone
+     * else happened to make something happen, so a lost DNS reply was never
+     * retried and the query simply hung.
+     *
+     * Horizon offers a driver no timer to wake on - IRQ 0 belongs to the
+     * kernel scheduler, and claiming it would displace the scheduler's own
+     * handler - so the loop yields instead. The round-robin scheduler keeps
+     * every other thread running, and polling the NIC each pass also makes
+     * the IRQ an optimisation rather than a correctness requirement.
+     */
     while (true) {
         struct msg req;
         long       payload_sz;
+        uint32_t   now;
 
-        /* Block until an IRQ fires or an IPC message arrives */
-        wait(IPORT_ANY);
-
-        /* peek() reports failure as (size_t)-1, so read it through a
-         * signed type before testing. */
+        /* peek() is non-blocking: it reports "nothing queued" as (size_t)-1,
+         * so read it through a signed type before testing. */
         payload_sz = (long)peek();
-        memset(&req, 0, sizeof(req));
 
-        if (payload_sz > 0) {
-            req.payload.buf  = malloc((size_t)payload_sz);
-            req.payload.size = (size_t)payload_sz;
-            if (!req.payload.buf)
+        if (payload_sz >= 0) {
+            memset(&req, 0, sizeof(req));
+
+            if (payload_sz > 0) {
+                req.payload.buf  = malloc((size_t)payload_sz);
+                req.payload.size = (size_t)payload_sz;
+            }
+
+            if (req.payload.size && !req.payload.buf) {
+                yield();
                 continue;
-        }
+            }
 
-        if (recv(&req) < 0) {
+            if (recv(&req) >= 0) {
+                if (req.from == IPORT_KERNEL)
+                    ne2000_irq_ack(&g_ne);   /* NE2000 IRQ; RX drained below */
+                else
+                    handle_request(&req);
+            }
+
             if (req.payload.buf)
                 free(req.payload.buf);
-            continue;
         }
 
-        if (req.from == IPORT_KERNEL) {
-            /*
-             * Hardware interrupt from NE2000 (IRQ 9).
-             * Drain all pending RX packets, tick the stack, then ACK.
-             */
+        /* Drain the NIC and tick the stack every pass, so timers and
+         * retransmits make progress with or without external events. */
+        {
             static uint8_t pkt_buf[1536];
             int pkt_len;
-            uint32_t now = clock_ms();
 
             while ((pkt_len = ne2000_rx(&g_ne, pkt_buf, sizeof(pkt_buf))) > 0)
                 wolfIP_recv(g_ip, pkt_buf, (uint32_t)pkt_len);
-
-            wolfIP_poll(g_ip, now);
-            ne2000_irq_ack(&g_ne);
-        } else {
-            /* IPC socket request from a user process */
-            wolfIP_poll(g_ip, clock_ms()); /* tick before handling */
-            handle_request(&req);
-            wolfIP_poll(g_ip, clock_ms()); /* tick after handling */
         }
 
-        if (req.payload.buf)
-            free(req.payload.buf);
+        now = clock_ms();
+        wolfIP_poll(g_ip, now);
+        expire_waiters(now);
+
+        yield();
     }
 
     return 0;

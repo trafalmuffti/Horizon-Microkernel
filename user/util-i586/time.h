@@ -24,20 +24,23 @@
  * rollover. Remainders are carried between calls, so no time is lost to
  * truncation.
  *
- * ACCURACY WARNING
- * ────────────────
- * TSC_PER_US below is an uncalibrated guess. Horizon exposes no userspace
- * time reference to calibrate against: the PIT is owned by the kernel
- * scheduler, and there is no timer syscall. On real hardware the TSC ticks
- * at the CPU's nominal frequency; under QEMU it generally ticks at the
- * host's rate, which is typically 2-3 GHz rather than the 100 MHz assumed
- * here. Until this constant is calibrated for the machine in question, the
- * values are correct in their ordering and proportion but NOT in absolute
- * magnitude, and callers should present them as such. Override at build
- * time with -DTSC_PER_US=<ticks per microsecond>.
+ * Where the rate comes from
+ * ─────────────────────────
+ * The TSC counts cycles, but its rate is not discoverable from userspace:
+ * CPUID does not report it on this baseline, and the only fixed-rate
+ * reference on the machine is the PIT, which the kernel owns for
+ * scheduling. The kernel therefore measures the TSC against the PIT once at
+ * boot and publishes the result, which tscfreq() reports in kHz.
+ *
+ * TSC_PER_US below is only the fallback used if that measurement is
+ * unavailable. It is a guess, and a poor one on most hosts: a QEMU guest
+ * generally sees the host's rate, measured at 2.1 GHz here rather than the
+ * 100 MHz assumed. Timings taken on the fallback are sound in ordering and
+ * proportion but not in absolute magnitude.
  */
 
 #include <stdint.h>
+#include <sys/svc.h>
 
 #ifndef TSC_PER_US
 #define TSC_PER_US 100U
@@ -52,6 +55,7 @@ static inline uint32_t tsc_read32(void)
 }
 
 /* Clock state. Header-only, so each program gets its own instance. */
+static uint32_t _clk_per_us;     /* ticks per microsecond, from the kernel */
 static uint32_t _clk_last_tsc;
 static uint32_t _clk_tsc_carry;  /* TSC ticks not yet worth a microsecond  */
 static uint32_t _clk_us_carry;   /* microseconds not yet worth a millisecond */
@@ -70,6 +74,15 @@ static void _clk_update(void)
     uint32_t delta, us;
 
     if (!_clk_started) {
+        /* Ask the kernel for the measured rate on first use. kHz/1000 is
+         * ticks per microsecond; the truncated remainder is worth under
+         * 0.001% and costs nothing to ignore. */
+        uint32_t khz = tscfreq();
+
+        _clk_per_us   = khz ? (khz / 1000U) : 0U;
+        if (!_clk_per_us)
+            _clk_per_us = TSC_PER_US;   /* uncalibrated fallback */
+
         _clk_started  = 1;
         _clk_last_tsc = now;
         return;
@@ -80,8 +93,8 @@ static void _clk_update(void)
     _clk_last_tsc = now;
 
     _clk_tsc_carry += delta;
-    us = _clk_tsc_carry / TSC_PER_US;   /* 32-bit div: inlined by gcc */
-    _clk_tsc_carry %= TSC_PER_US;
+    us = _clk_tsc_carry / _clk_per_us;  /* 32-bit div: inlined by gcc */
+    _clk_tsc_carry %= _clk_per_us;
 
     _clk_us += us;
 

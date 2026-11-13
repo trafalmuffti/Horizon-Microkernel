@@ -39,6 +39,9 @@ LINKVAR(___ekernel, __ekernel);
 
 #undef LINKVAR
 
+// Measured once by arch_init() and handed to userspace via syscall_tscfreq.
+static uint32_t tsc_khz = 0;
+
 void arch_init()
 {
 	gdt_init(kernel_gdt());
@@ -48,6 +51,12 @@ void arch_init()
 	idt_init(kernel_idt());
 	idt_load(kernel_idt());
 	dtrace("Installed main kernel IDT. (interrupts are INT32 ring 0)");
+
+	// Measure the TSC now, while the PIT is still idle and nothing else
+	// competes for it: the scheduler claims channel 0 later, and no
+	// interrupt source is live yet to perturb the measurement.
+	tsc_khz = pit_calibrate_tsc();
+	dtrace("Calibrated TSC at %i kHz.", tsc_khz);
 }
 
 void arch_timer_init(size_t freq, int_callback_t handle)
@@ -55,6 +64,21 @@ void arch_timer_init(size_t freq, int_callback_t handle)
 	int_callback_set(irq_to_isr(PIT_IRQ), false, handle);
 	pic_irq_enable(PIT_IRQ);
 	pit_timer_set(PIT_TIMER0, freq, PIT_OUTMODE_SQRWAVE);
+}
+
+uint32_t arch_tsc_khz()
+{
+	return tsc_khz;
+}
+
+void arch_idle()
+{
+	/* sti only takes effect after the following instruction, so the hlt
+	 * cannot be missed by an interrupt arriving in between: the pair is
+	 * atomic with respect to wakeups. Without that ordering a wakeup
+	 * landing between the two would leave the CPU halted until the next
+	 * one. */
+	__asm ("sti; hlt; cli" ::: "memory");
 }
 
 int arch_sysio(size_t action, size_t arg, uintptr_t data)

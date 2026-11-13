@@ -46,6 +46,14 @@
 #define PING_TIMEOUT_MS 4000    /* Per-request wait before giving up */
 
 /*
+ * Bounds on the two operations that can block indefinitely. netd defers
+ * those replies until the network answers, so without a deadline a filtered
+ * echo or a silent DNS server would hang ping rather than reporting the
+ * failure, which is the one outcome a reachability tool must never produce.
+ */
+#define PING_RESOLVE_TIMEOUT_MS 5000
+
+/*
  * TCP fallback probe.
  *
  * ICMP is filtered on many networks, so a total loss of echo replies does not
@@ -212,7 +220,7 @@ static long tcp_probe(uint32_t ip, uint16_t port)
     }
 
     /* ...so wait for the handshake to actually complete. */
-    if (net_call(NET_CMD_WAITCONN, (msgdata_t)sock, 0, 0,
+    if (net_call(NET_CMD_WAITCONN, (msgdata_t)sock, PING_TIMEOUT_MS, 0,
                  NULL, 0, NULL, 0) < 0) {
         net_call(NET_CMD_CLOSE, (msgdata_t)sock, 0, 0, NULL, 0, NULL, 0);
         return -1;
@@ -241,11 +249,26 @@ int main(void)
     while ((g_netd = svcid(SVC_NET)) == 0)
         yield();
 
-    /* ── Resolve the target ── */
+    /* ── Resolve the target ──
+     * Announce before doing anything that can block, so the operator sees
+     * what is being attempted even if a later step never completes. */
     if (!parse_ipv4(target, &dest_ip)) {
-        long r = net_call(NET_CMD_RESOLVE, 0, 0, 0,
-                          target, strlen(target) + 1, NULL, 0);
-        if (r <= 0) {
+        long r;
+
+        printf("PING %s: resolving...\n", target);
+
+        r = net_call(NET_CMD_RESOLVE, PING_RESOLVE_TIMEOUT_MS, 0, 0,
+                     target, strlen(target) + 1, NULL, 0);
+
+        /*
+         * Unlike every other command, this reply is an IPv4 address and so
+         * uses the full 32-bit range: 160.79.104.10 is 0xA04F680A, which
+         * reads as negative when taken as a signed status. Testing r <= 0
+         * therefore rejected every address at or above 128.0.0.0. netd
+         * reports failure as zero, so test for exactly that; the 32 bits
+         * round-trip intact and cast back cleanly.
+         */
+        if (r == 0) {
             printf("ping: cannot resolve %s\n", target);
             return 1;
         }
@@ -302,8 +325,8 @@ int main(void)
         sent++;
 
         memset(reply, 0, sizeof(reply));
-        n = net_call(NET_CMD_RECV, (msgdata_t)sock, sizeof(reply), 0,
-                     NULL, 0, reply, sizeof(reply));
+        n = net_call(NET_CMD_RECV, (msgdata_t)sock, sizeof(reply),
+                     PING_TIMEOUT_MS, NULL, 0, reply, sizeof(reply));
 
         rtt_us = clock_us() - t0;
 
@@ -315,6 +338,22 @@ int main(void)
             printf("Unexpected ICMP type %u for icmp_seq=%d\n",
                    (unsigned)reply[0], seq);
             continue;
+        }
+
+        /*
+         * A genuine echo reply carries back the sequence number of the
+         * request that prompted it. Accepting any reply would let an
+         * unrelated or synthesised packet count as proof of reachability,
+         * which is the one thing this tool exists to establish, so treat a
+         * mismatch as a distinct and visible outcome rather than success.
+         */
+        {
+            int reply_seq = (reply[6] << 8) | reply[7];
+            if (reply_seq != seq) {
+                printf("Reply for icmp_seq=%d carried seq=%d "
+                       "(not an answer to this request)\n", seq, reply_seq);
+                continue;
+            }
         }
 
         received++;
