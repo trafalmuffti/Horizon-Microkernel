@@ -28,14 +28,29 @@ EXTERN int_callback_common
 ; Macros
 ; ======
 
+; 'strict dword' forces the 5-byte push encoding on every stub.
+;
+; Without it NASM picks the shortest form: 'push imm8' for vectors 0-127 and
+; 'push imm32' from 128 up, making the stubs 7 and 10 bytes respectively.
+; idt_entry_set() locates a stub as __sisr + (__eisr - __sisr) * i, and
+; ___sisr/___eisr bracket isr0, so that stride is whatever isr0 happens to
+; assemble to. A variable stub size therefore mistargeted every vector from
+; 128 up, drifting 3 bytes per vector; the syscall gate at 0x95 landed 63
+; bytes short, in the middle of isr142's jmp. Hardware IRQs sit below 128 and
+; were unaffected, which is why only system calls faulted.
+; Both operands are pinned to their long form. 'strict dword' on the push
+; stops NASM shortening vectors 0-127 to 'push imm8', and 'strict near' on
+; the jmp stops it shortening the last ~18 stubs to a rel8 branch, those
+; being close enough to the entry point below to reach it in one byte of
+; displacement. Either optimisation on its own is enough to break the stride.
 %MACRO ISR_STUB_NOERR 1
-isr%1: push %1
-       jmp isr_noerr_entry
+isr%1: push strict dword %1
+       jmp strict near isr_noerr_entry
 %ENDMACRO
 
 %MACRO ISR_STUB_ERR 1
-isr%1: push %1
-       jmp isr_entry
+isr%1: push strict dword %1
+       jmp strict near isr_entry
 %ENDMACRO
 
 ; =========

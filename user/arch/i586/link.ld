@@ -5,7 +5,10 @@ SECTIONS
 {
     .text 0x1000000 :
     {
-        *(.text)
+        /* Collect .text.* too, so compiler-generated subsections such as
+         * the x86 register thunks are not left as orphans placed after the
+         * read-only sections. */
+        *(.text .text.*)
         . = ALIGN(4096);
     }
     
@@ -26,5 +29,15 @@ SECTIONS
         *(.bss)
         *(COMMON)
         . = ALIGN(4096);
+    }
+
+    /* No unwinder or runtime metadata consumer here; dropping these keeps
+     * them from being emitted as orphan sections between the loadable ones. */
+    /DISCARD/ :
+    {
+        *(.eh_frame)
+        *(.eh_frame_hdr)
+        *(.comment)
+        *(.note .note.*)
     }
 }

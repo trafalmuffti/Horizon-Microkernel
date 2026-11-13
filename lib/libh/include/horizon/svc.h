@@ -10,6 +10,7 @@ enum SVC
 	SVC_PROCMGR,
 	SVC_DEVMGR,
 	SVC_VFS,
+	SVC_NET,
 
 	SVCMAX
 };

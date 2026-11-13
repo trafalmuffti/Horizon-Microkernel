@@ -11,9 +11,13 @@ EXTERN main
 EXTERN kill
 
 ; =====================
-; Program Entry (.code)
+; Program Entry (.text)
 ; =====================
-SECTION .code
+; This must be .text: the linker script gathers *(.text), so declaring .code
+; left _start in an orphan section that the linker placed past .rodata and
+; .eh_frame, at the tail of the file-backed region. Every program then
+; entered at an address that was not mapped as code and faulted immediately.
+SECTION .text
 BITS 32
 
 _start: mov  esp, _init_stack

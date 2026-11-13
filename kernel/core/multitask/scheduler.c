@@ -167,8 +167,13 @@ void scheduler_lock()
 //! Re-enable the scheduler before returning from a context switch.
 void scheduler_unlock()
 {
-	// FIXME: Wait for an interrupt instead of panicking.
-	dassert(active_thread.raw);
+	/* Every thread may be blocked - all of them waiting on IPC, say. That
+	 * is an ordinary state, not an error: the CPU has nothing to run until
+	 * an interrupt readies someone. Park until one arrives rather than
+	 * panicking, which previously killed the system as soon as two
+	 * cooperating processes happened to block at the same moment. */
+	while (!active_thread.raw)
+		arch_idle();
 
 	locked = false;
 
@@ -188,7 +193,11 @@ thread_uid_t scheduler_curr()
 // Update the timeslice of the running thread and possibly switch.
 void timer_tick(isr_t isr, irq_t irq)
 {
-	// A thread should always exist at this point.
+	/* The tick can land while the CPU is idling in scheduler_unlock() with
+	 * no thread scheduled. There is no timeslice to charge in that case. */
+	if (!active_thread.raw)
+		return;
+
 	thread_t* curr = thread_get(active_thread);
 	dassert(curr);
 

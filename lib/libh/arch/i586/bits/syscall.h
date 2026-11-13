@@ -25,5 +25,7 @@ enum
 	SYS_svcown,
 	SYS_svcid,
 
-	SYS_sysio
+	SYS_sysio,
+
+	SYS_tscfreq
 };

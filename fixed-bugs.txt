@@ -1,0 +1,250 @@
+FIXED BUGS
+==========
+
+Bugs fixed on branch claude/integrate-wolfip-lslji while integrating wolfIP
+and bringing up ping under QEMU.
+
+Part A lists bugs that already existed in the repository. Part B lists bugs
+introduced during this work and fixed later in the same work; they are listed
+too, because the history should show them.
+
+Every entry says how the fix was verified. "Compiled" means only that it
+builds. "Booted" means it was observed running under QEMU. "Not exercised"
+means the fixed code path never ran in any observed boot.
+
+
+PART A - PRE-EXISTING BUGS
+--------------------------
+
+A1. libh: size_t / ptrdiff_t declared with conflicting types
+    File:     lib/libh/include/inttypes.h
+    Symptom:  Any file that included both <stddef.h> and <inttypes.h> failed
+              to compile. libh itself did not build.
+    Cause:    inttypes.h hardcoded unsigned long / long. stddef.h used
+              __SIZE_TYPE__ / __PTRDIFF_TYPE__, which are int on i386. C
+              treats long and int as distinct types even at the same width.
+    Fix:      Take both types from the compiler built-ins, as stddef.h does.
+    Verified: Compiled (libh builds).
+
+A2. libh: <stdint.h> had no limit macros
+    File:     lib/libh/include/stdint.h
+    Symptom:  Conforming code using UINT32_MAX, SIZE_MAX and similar did not
+              compile. wolfIP was one example.
+    Cause:    C99 7.18.2 and 7.18.4 macros were missing entirely.
+    Fix:      Added the exact-width, least-width, fast-width, pointer and max
+              limits, plus the INTn_C / UINTn_C macros.
+    Verified: Compiled (wolfIP builds against it).
+
+A3. libh: putchar() was a stub, so all userspace printf output was lost
+    File:     lib/libh/src/stdio/putchar.c
+    Symptom:  printf() in any userspace program printed nothing.
+    Cause:    putchar() was "// FIXME: Implement." and returned 0.
+    Fix:      Write to COM1 through sysio(), with a bounded wait on the LSR.
+              This works for PRIV_DRIVER processes, which includes boot
+              modules.
+    Verified: Booted. ping's output appears on the serial console.
+
+A4. kernel: exception diagnostics unreachable; most exceptions panicked
+    File:     kernel/arch/i586/sw/int/exception.c
+    Symptom:  Every exception except NMI and #PF panicked with
+              "Reserved/invalid exception occurred!" instead of printing its
+              own diagnostic. Under GCC 13 it also failed to build
+              (-Werror=switch-unreachable).
+    Cause:    The message-lookup groups were wrapped in an outer switch(isr)
+              and placed before its first case label, so they could never run.
+    Fix:      Restructured as do { ... } while (0), so the existing early-exit
+              breaks still work. NMI and #PF moved into a final switch.
+    Verified: Compiled. The #PF path was exercised under QEMU, and its
+              diagnostic printed. The other groups were not exercised.
+
+A5. kernel: boot modules above 4 MB were unmapped
+    File:     kernel/arch/i586/stub/boot.nasm
+    Symptom:  Supplying any boot module caused an endless page-fault loop
+              in module_init(), about 780,000 faults. With no modules, the
+              kernel booted.
+    Cause:    The bootstrap identity map covered only the first 4 MB. The
+              kernel's BSS reserve ends its image exactly at 0x400000, so the
+              bootloader places modules just above that. CR2 was 0x00400000.
+    Fix:      Identity map the second 4 MB with an extra page table.
+    Verified: Booted. Modules found at 0x401000 and 0x416000. Both
+              processes created.
+
+A6. userspace: _start in an orphan section; every program faulted on entry
+    Files:    user/arch/i586/crt0_min.nasm, user/arch/i586/link.ld
+    Symptom:  No userspace program could start.
+    Cause:    crt0 declared "SECTION .code", but the linker script collects
+              only *(.text). _start became an orphan section placed after
+              .rodata and .eh_frame, outside the executable segment. In ping,
+              the entry point was 0x010045f0, symbol type R.
+    Fix:      Use SECTION .text. The linker script now also collects
+              .text.* and discards .eh_frame, .comment and .note.
+    Verified: nm shows _start at 0x010009b0, type T, inside the R E
+              segment. Booted; execution reaches _start.
+
+A7. kernel: new threads were switched to without a ring-3 context
+    File:     kernel/arch/i586/sw/task.c
+    Symptom:  A thread started through task_switch() ran with the kernel CS
+              and faulted at once.
+    Cause:    For a new task, task_switch() set only EIP and user_esp. The
+              interrupted kernel's CS, SS and EFLAGS stayed in the frame.
+    Fix:      Set CS=0x1B, SS/DS/ES/FS/GS=0x23 and EFLAGS=0x202, the same
+              selectors task_start() uses.
+    Verified: Booted. The fault frame now shows CS:0x1B, DS:0x23, SS:0x23,
+              EFLAGS:0x202.
+
+A8. kernel: every interrupt vector >= 128 was mistargeted, so all syscalls
+    faulted
+    File:     kernel/arch/i586/stub/isr_wrapper.nasm
+    Symptom:  The first system call faulted at CPL 0, mid-instruction inside
+              an ISR stub (CR2=0x13). Hardware IRQs worked.
+    Cause:    idt_entry_set() finds a stub as __sisr + (__eisr - __sisr) * i,
+              taking the stride from isr0. The stubs were not all the same
+              size. NASM shortened "push imm32" to "push imm8" for vectors
+              0-127, and shortened the jmp to rel8 for the last ~18 stubs.
+              Stubs were 7 or 10 bytes, so addresses drifted 3 bytes per
+              vector above 127. The syscall gate 0x95 landed 63 bytes short,
+              inside isr142's jmp, and decoded as "add %al,(%eax)".
+    Fix:      "push strict dword" and "jmp strict near" in both macros.
+    Verified: An exhaustive check confirmed that all 256 vectors resolve to
+              their stubs. Booted; syscalls dispatch with zero faults.
+
+A9. kernel: scheduler panicked when no thread was runnable
+    Files:    kernel/core/multitask/scheduler.c, kernel/arch/i586/arch.{c,h}
+    Symptom:  "Assertion failure in scheduler_unlock". This happened as soon
+              as netd and ping were both blocked on IPC.
+    Cause:    No idle path existed; the code carried
+              "FIXME: Wait for an interrupt instead of panicking."
+    Fix:      scheduler_unlock() now waits in arch_idle() (sti; hlt; cli)
+              until a thread becomes runnable. timer_tick() returns early
+              when no thread is active.
+    Verified: Booted. The system idles stably instead of panicking.
+
+
+PART B - BUGS INTRODUCED DURING THIS WORK, THEN FIXED
+-----------------------------------------------------
+
+B1. netd, ping: peek() failure treated as a huge payload size
+    Symptom:  When peek() failed, the code would have called malloc(SIZE_MAX).
+    Cause:    peek() returns (size_t)-1 on error. The code tested it as
+              size_t > 0.
+    Fix:      Read the result as a signed value before testing it.
+    Verified: Found by reading before the first run. The error path was not
+              exercised.
+
+B2. 64-bit division needing libgcc's __udivdi3
+    Files:    user/util-i586/time.h, kernel/arch/i586/hw/pit.c
+    Symptom:  Link failure: undefined reference to __udivdi3. Userspace and
+              the kernel both link with -nodefaultlibs.
+    Fix:      Accumulate 32-bit TSC deltas in userspace. In the kernel, divide
+              cycles by the window length in ms, using 32-bit arithmetic.
+    Verified: Links.
+
+B3. wolfIP_getrandom() not provided
+    Symptom:  Link failure in netd.
+    Cause:    wolfip.h requires every port to supply this function.
+    Fix:      Added user/netd-i586/wolfip_port.c: xorshift32 seeded from
+              the TSC. It is documented in the file as non-cryptographic.
+    Verified: Links. Used by wolfIP for ICMP ids and TCP ports during runs.
+
+B4. netd: no DNS server configured
+    Symptom:  nslookup() would have failed with -101.
+    Fix:      WOLFIP_STATIC_DNS_IP set to 10.0.2.3, QEMU's DNS forwarder.
+    Verified: Booted. The packet capture shows a query to 10.0.2.3 and an
+              A-record reply.
+
+B5. netd: WOLFIP_DEFAULT_* constants undeclared
+    Cause:    main.c did not include config.h.
+    Fix:      Added the include.
+    Verified: Compiled.
+
+B6. ping: %ld with a printf that has no length modifiers
+    Symptom:  The byte count would have been misformatted.
+    Fix:      Use %d with an explicit int cast.
+    Verified: Booted. Output shows "40 bytes from ...".
+
+B7. ping: round-trip times had millisecond resolution
+    Symptom:  Sub-millisecond RTTs printed as 0 or 1 ms.
+    Fix:      The clock now counts microseconds. print_duration() renders
+              three decimal places.
+    Verified: Booted. Output shows "4.592 ms".
+
+B8. Clock assumed a 100 MHz TSC
+    Symptom:  All times were inflated about 21x.
+    Fix:      The kernel measures the TSC against PIT channel 2 at boot
+              (pit_calibrate_tsc) and publishes the rate through the new
+              syscall SYS_tscfreq. time.h uses that rate, falling back to the
+              constant only if calibration failed.
+    Verified: Booted. The kernel logs "Calibrated TSC at 2100012 kHz". The
+              reported TCP RTT of 4.592 ms compares with about 3.4 ms of wire
+              time in the capture.
+
+B9. netd: wolfIP was ticked only when an event arrived
+    Symptom:  Without an IRQ or an IPC request, wolfIP timers never ran.
+              Retransmits and DNS retries could not happen.
+    Fix:      The main loop polls with a non-blocking peek(). Each pass it
+              drains the NIC, calls wolfIP_poll() and yields.
+    Verified: Booted. DNS, ICMP and TCP all completed. In the observed run
+              the DNS reply arrived on the first attempt, so the retry path
+              was not exercised.
+
+B10. netd: deferred replies had no deadline
+    Symptom:  A filtered echo or a silent DNS server would have hung the
+              client forever.
+    Fix:      Each deferred reply carries a deadline: RECV args[2],
+              RESOLVE args[0], WAITCONN args[1]. expire_waiters() fails
+              overdue requests. ping passes timeouts.
+    Verified: Compiled. Not exercised. No observed run hit a deadline.
+
+B11. ping: printed nothing until resolution succeeded
+    Symptom:  A failing or hung lookup produced no output at all.
+    Fix:      Print "PING <host>: resolving..." before blocking.
+    Verified: Booted.
+
+B12. ping: resolved IPv4 address treated as a signed status
+    Symptom:  "cannot resolve claude.ai" even though DNS returned
+              160.79.104.10. Every address at or above 128.0.0.0 was
+              rejected.
+    Cause:    0xA04F680A is negative as int32_t, and the code tested r <= 0.
+    Fix:      Treat only zero as failure, which is what netd reports.
+    Verified: Instrumented netd showed the DNS callback firing with the
+              correct IP. After the fix, ping prints the resolved address.
+
+B13. ping: echo replies accepted without checking the sequence number
+    Symptom:  "4 received, 0% loss" for replies that SLIRP generated locally
+              (seq=0, TTL=255), not replies from the target.
+    Fix:      Require the reply seq to match the request. Report a mismatch
+              as a separate, visible outcome.
+    Verified: Booted. Those replies are now rejected.
+
+B14. netd: NET_CMD_CONNECT passed wolfIP's -EAGAIN through as an error
+    Symptom:  The TCP fallback always failed. On the wire: SYN, SYN|ACK,
+              then RST from the guest.
+    Cause:    -EAGAIN means "in progress". ping took it as failure and closed
+              the socket, so the SYN|ACK reached a closed socket and wolfIP
+              sent a reset. net_svc.h already documented 0 for this case.
+    Fix:      netd maps -EAGAIN to 0.
+    Verified: Booted. The capture shows SYN, SYN|ACK, ACK, then a clean
+              FIN/ACK four-way close.
+
+B15. Clock lost whole wraps when more than 2^32 cycles passed between reads
+    File:     user/util-i586/time.h, user/ping-i586/main.c
+    Symptom:  An interval longer than one wrap of the low 32 TSC bits came
+              out short. That is 2.05 s at the measured 2.1 GHz, or 1.07 s at
+              4 GHz. ping reads the clock before and after a blocking wait of
+              up to 4 s, so a slow reply would have been timed wrong. In
+              testing, a 3.0 s gap would have been reported as 0.95 s.
+    Cause:    The clock read only the low 32 bits of the TSC. Unsigned
+              subtraction recovers one wrap but cannot see how many wraps
+              occurred. An absolute difference |a - b| would be worse: it
+              turns even a single wrap into ~2 s of phantom time.
+    Fix:      Read all 64 bits; that counter takes centuries to wrap. Convert
+              the delta in chunks of at most 2^31 cycles, so every division
+              stays 32-bit and libgcc is not needed. ping's per-request wait
+              is reduced from 4 s to 1.5 s, which is ample for terrestrial
+              round trips.
+    Verified: The real header was compiled on the host (x86-64; there are no
+              32-bit libc headers) and used to time a 3.0002 s sleep across
+              1.5 wraps: measured 3.0016 s, error 0.05%. nm confirms the guest
+              binaries reference no __udivdi3 or __umoddi3. Booted: ping
+              behaves as before. The 1.5 s timeout did not fire in the
+              observed run, because every request received some reply.

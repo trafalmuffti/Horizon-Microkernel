@@ -60,6 +60,8 @@ void syscall_svcid(svc_t svc);
 
 void syscall_sysio(sysop_t action, size_t arg, uintptr_t data);
 
+void syscall_tscfreq();
+
 SYSCALL_TABLE = 
 {
 	{ syscall_spawn,    0 },
@@ -88,6 +90,8 @@ SYSCALL_TABLE =
 	{ syscall_svcid,    1 },
 
 	{ syscall_sysio,    3 },
+
+	{ syscall_tscfreq,  0 },
 
 	0
 };

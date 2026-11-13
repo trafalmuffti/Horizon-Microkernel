@@ -28,3 +28,15 @@ static inline void pause()
 {
 	__asm ("pause" ::: "memory");
 }
+
+#include <stdint.h>
+
+//! Read the CPU timestamp counter as a single 64-bit value.
+/*! A convenience over rdtsc() in instr/info.h, which returns the halves
+ *  separately; cycle deltas are easier to reason about unsplit. */
+static inline uint64_t rdtsc64()
+{
+	uint32_t lo, hi;
+	__asm ("rdtsc" : "=a"(lo), "=d"(hi));
+	return ((uint64_t)hi << 32) | lo;
+}

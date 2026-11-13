@@ -1,0 +1,7 @@
+# Build output
+build/
+
+# Object files and archives
+*.o
+*.a
+*.elf

@@ -30,3 +30,8 @@
 
 void pit_timer_set(PIT_TIMER timer, size_t freq, PIT_OUTMODE mode);
 void pit_sleep(size_t msec);
+
+//! Measure the CPU timestamp counter against the PIT.
+/*! Returns the TSC rate in kHz. kHz rather than Hz keeps the figure inside
+ *  32 bits for any plausible CPU, since a syscall return is pointer-sized. */
+uint32_t pit_calibrate_tsc();

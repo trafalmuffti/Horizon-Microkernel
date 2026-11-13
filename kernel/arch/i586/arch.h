@@ -69,3 +69,14 @@ void arch_init();
 void arch_timer_init(size_t freq, int_callback_t handle);
 
 int arch_sysio(size_t action, size_t arg, uintptr_t data);
+
+//! Rate of the CPU timestamp counter in kHz, measured once at boot.
+/*! Zero if calibration failed. Userspace needs this to turn TSC deltas into
+ *  real time; it has no other time reference, since the PIT belongs to the
+ *  kernel and there is no timer syscall. */
+uint32_t arch_tsc_khz();
+
+//! Park the CPU until the next interrupt arrives.
+/*! Interrupts are enabled for the wait and disabled again on return, so a
+ *  caller holding them off keeps that guarantee either side of the call. */
+void arch_idle();

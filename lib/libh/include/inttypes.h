@@ -24,11 +24,27 @@ typedef unsigned long uint64_t;
 typedef long long intmax_t;
 typedef unsigned long long uintmax_t;
 
+/*
+ * Derive the pointer-sized types from the compiler's own definitions so they
+ * agree with <stddef.h>.  Hardcoding these as long/unsigned long conflicts
+ * with __SIZE_TYPE__ / __PTRDIFF_TYPE__ (int on i386): C treats long and int
+ * as distinct types even at equal width, so any translation unit including
+ * both headers failed to compile.
+ */
+#ifdef __GNUC__
+typedef __SIZE_TYPE__    size_t;
+typedef __UINTPTR_TYPE__ uintptr_t;
+
+typedef __INTPTR_TYPE__  ssize_t;
+typedef __INTPTR_TYPE__  intptr_t;
+typedef __PTRDIFF_TYPE__ ptrdiff_t;
+#else
 typedef unsigned long size_t;
 typedef unsigned long uintptr_t;
 
 typedef long ssize_t;
 typedef long intptr_t;
 typedef long ptrdiff_t;
+#endif
 
 #endif
