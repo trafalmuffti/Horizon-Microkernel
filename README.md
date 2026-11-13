@@ -2,6 +2,8 @@ Horizon Microkernel
 =
 A hobby operating system written in C for the x86 architecture. The kernel is mostly complete and includes multitasking, messaging IPC, and a full set of system calls. Work is still being done on userspace drivers and services; an experimental VFS with keyboard and screen drivers has been implemented so far.
 
+This has been forked after the [original[(https://github.com/wquist/Horizon-Microkernel) was archived. 
+
 Features
 -
 The microkernel tries not to be a direct copy of any existing operating systems. Special focus went into the areas of inter-process communication and system calls.
