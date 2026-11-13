@@ -29,3 +29,14 @@ implying it ran.
 
 Do not present illustrative or placeholder output as though it were a captured
 result.
+
+## Logging fixed bugs
+
+Every bug fixed in this repository is logged in `fixed-bugs.txt`, in the same
+change as the fix. That includes bugs introduced and fixed within the same
+piece of work.
+
+Each entry gives the file(s), the symptom, the cause, the fix, and how the fix
+was verified. Write "compiled", "booted under QEMU", or "not exercised", as
+in the Verification section above. Put entries in Part A if the bug predates
+the work, Part B if the work introduced it, and keep numbering sequential.

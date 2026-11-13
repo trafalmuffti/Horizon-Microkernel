@@ -46,6 +46,8 @@
 #define TSC_PER_US 100U
 #endif
 
+/* Low 32 bits of the TSC. Kept for wolfIP_getrandom()'s entropy mixing,
+ * where only the fast-changing low bits matter. Not for timing. */
 static inline uint32_t tsc_read32(void)
 {
     uint32_t lo, hi;
@@ -54,9 +56,20 @@ static inline uint32_t tsc_read32(void)
     return lo;
 }
 
+/* The full 64-bit TSC. It takes centuries to wrap at any real clock rate,
+ * so a delta between two readings is exact however long apart they are.
+ * 64-bit subtraction and comparison are inline; only 64-bit division needs
+ * libgcc, and none is done here. */
+static inline uint64_t tsc_read64(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 /* Clock state. Header-only, so each program gets its own instance. */
 static uint32_t _clk_per_us;     /* ticks per microsecond, from the kernel */
-static uint32_t _clk_last_tsc;
+static uint64_t _clk_last_tsc;
 static uint32_t _clk_tsc_carry;  /* TSC ticks not yet worth a microsecond  */
 static uint32_t _clk_us_carry;   /* microseconds not yet worth a millisecond */
 static uint32_t _clk_us;         /* microseconds since first call           */
@@ -65,13 +78,21 @@ static int      _clk_started;
 
 /*
  * _clk_update - fold elapsed TSC ticks into the microsecond and
- * millisecond counters. Must run at least once per TSC rollover
- * (~43 s at 100 MHz, ~1.4 s at 3 GHz) to stay accurate.
+ * millisecond counters.
+ *
+ * This previously read only the low 32 bits of the TSC. Unsigned
+ * subtraction handles one wrap correctly, but the low word wraps every
+ * 2^32 cycles: 2.05 s at the 2.1 GHz measured here, 1.07 s at 4 GHz. If
+ * more time than that passed between two calls - ping blocks across a
+ * whole reply timeout - whole wraps vanished from the delta and the
+ * interval came out short. Reading all 64 bits removes the limit at any
+ * clock rate.
  */
 static void _clk_update(void)
 {
-    uint32_t now = tsc_read32();
-    uint32_t delta, us;
+    uint64_t now = tsc_read64();
+    uint64_t delta;
+    uint32_t us;
 
     if (!_clk_started) {
         /* Ask the kernel for the measured rate on first use. kHz/1000 is
@@ -88,19 +109,28 @@ static void _clk_update(void)
         return;
     }
 
-    /* Unsigned subtraction yields the correct delta even across a wrap. */
     delta = now - _clk_last_tsc;
     _clk_last_tsc = now;
 
-    _clk_tsc_carry += delta;
-    us = _clk_tsc_carry / _clk_per_us;  /* 32-bit div: inlined by gcc */
-    _clk_tsc_carry %= _clk_per_us;
+    /* Convert in chunks of at most 2^31 cycles so each step uses 32-bit
+     * division (64-bit division would need libgcc's __udivdi3). The carry
+     * is always below _clk_per_us, so carry + chunk cannot overflow. A
+     * multi-second gap takes only a few passes. */
+    while (delta) {
+        uint32_t chunk = (delta > 0x80000000ULL) ? 0x80000000U
+                                                 : (uint32_t)delta;
+        delta -= chunk;
 
-    _clk_us += us;
+        _clk_tsc_carry += chunk;
+        us = _clk_tsc_carry / _clk_per_us;
+        _clk_tsc_carry %= _clk_per_us;
 
-    _clk_us_carry += us;
-    _clk_ms += _clk_us_carry / 1000U;
-    _clk_us_carry %= 1000U;
+        _clk_us += us;
+
+        _clk_us_carry += us;
+        _clk_ms += _clk_us_carry / 1000U;
+        _clk_us_carry %= 1000U;
+    }
 }
 
 /* Microseconds since the first call. Wraps after ~71 minutes. */

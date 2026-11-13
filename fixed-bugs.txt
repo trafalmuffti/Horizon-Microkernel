@@ -225,3 +225,26 @@ B14. netd: NET_CMD_CONNECT passed wolfIP's -EAGAIN through as an error
     Fix:      netd maps -EAGAIN to 0.
     Verified: Booted. The capture shows SYN, SYN|ACK, ACK, then a clean
               FIN/ACK four-way close.
+
+B15. Clock lost whole wraps when more than 2^32 cycles passed between reads
+    File:     user/util-i586/time.h, user/ping-i586/main.c
+    Symptom:  An interval longer than one wrap of the low 32 TSC bits came
+              out short. That is 2.05 s at the measured 2.1 GHz, or 1.07 s at
+              4 GHz. ping reads the clock before and after a blocking wait of
+              up to 4 s, so a slow reply would have been timed wrong. In
+              testing, a 3.0 s gap would have been reported as 0.95 s.
+    Cause:    The clock read only the low 32 bits of the TSC. Unsigned
+              subtraction recovers one wrap but cannot see how many wraps
+              occurred. An absolute difference |a - b| would be worse: it
+              turns even a single wrap into ~2 s of phantom time.
+    Fix:      Read all 64 bits; that counter takes centuries to wrap. Convert
+              the delta in chunks of at most 2^31 cycles, so every division
+              stays 32-bit and libgcc is not needed. ping's per-request wait
+              is reduced from 4 s to 1.5 s, which is ample for terrestrial
+              round trips.
+    Verified: The real header was compiled on the host (x86-64; there are no
+              32-bit libc headers) and used to time a 3.0002 s sleep across
+              1.5 wraps: measured 3.0016 s, error 0.05%. nm confirms the guest
+              binaries reference no __udivdi3 or __umoddi3. Booted: ping
+              behaves as before. The 1.5 s timeout did not fire in the
+              observed run, because every request received some reply.

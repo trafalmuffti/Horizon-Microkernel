@@ -43,7 +43,9 @@
 
 #define PING_COUNT      4       /* Number of echo requests to send  */
 #define PING_PAYLOAD    32      /* Payload bytes after the header   */
-#define PING_TIMEOUT_MS 4000    /* Per-request wait before giving up */
+/* Per-request wait before giving up: an echo reply, or the TCP fallback's
+ * handshake. 1.5 s comfortably covers terrestrial round trips. */
+#define PING_TIMEOUT_MS 1500
 
 /*
  * Bounds on the two operations that can block indefinitely. netd defers
